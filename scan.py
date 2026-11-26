@@ -9,7 +9,12 @@ SteamT-Data — облачный сборщик цен значков Steam.
 """
 import gzip, json, os, subprocess, sys, time, urllib.parse, urllib.request, urllib.error
 
-PAGE = 100
+PAGE = 100          # карточек за запрос (максимум Steam)
+STEP = 85           # шаг страниц меньше размера -> страницы перекрываются на 15 карточек,
+                    # поэтому сдвиг списка во время многочасового скана не «проглатывает» карточки
+KEEP_MS = 3 * 24 * 3600 * 1000   # карточку удаляем, только если её не видно 3 суток
+MIN_SET = 5         # в наборе Steam минимум 5 карточек — меньше значит набор собран не полностью
+REPAIR_EVERY = 6 * 3600          # проверка неполных наборов не чаще раза в 6 ч
 DEADLINE = time.time() + float(os.environ.get("RUN_SECONDS", 5 * 3600 + 20 * 60))
 PUBLISH_EVERY = float(os.environ.get("PUBLISH_EVERY", 20 * 60))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))      # для теста
@@ -44,12 +49,15 @@ class Limited(Exception):
     pass
 
 
-def fetch_page(start):
+def fetch_page(start, sort=4, app=None):
+    filters = {"item_class": ["item_class_2"], "cardborder": ["cardborder_0"]}
+    if app:
+        filters["Game"] = ["app_%d" % app]
     q = [{
         "appid": 753, "strQuery": "",
-        "filters": {"item_class": ["item_class_2"], "cardborder": ["cardborder_0"]},
+        "filters": filters,
         "price": {"eCurrency": 1}, "accessoryFilters": {},
-        "sort": 4, "direction": 1, "start": start, "count": PAGE,
+        "sort": sort, "direction": 1, "start": start, "count": PAGE,
     }]
     url = "https://steamcommunity.com/market/actions?q=Search&qp=" + urllib.parse.quote(json.dumps(q, separators=(",", ":")))
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept-Language": "en"})
@@ -91,6 +99,22 @@ def game_name(t):
     return t.replace("Trading Card", "").replace("Коллекционная карточка", "").strip(" -—")
 
 
+def store(cards, results):
+    now = int(time.time() * 1000)
+    n = 0
+    for r in results:
+        h = r["strHash"]
+        try:
+            appid = int(h.split("-", 1)[0])
+        except ValueError:
+            continue
+        ad = r.get("asset_description", {})
+        cards[h] = [appid, game_name(ad.get("type", "")), ad.get("name", ""),
+                    price(r.get("strMinSellSubtotal", "")), int(r.get("cSellOrders", 0)), now]
+        n += 1
+    return n
+
+
 def clean(s):
     return s.replace("\t", " ").replace("\n", " ")
 
@@ -129,33 +153,72 @@ def main():
     download_state()
     state = load_state()
     cards = state["cards"]
+    if state.get("cycle") and "sort" not in state["cycle"]:
+        state["cycle"] = None   # цикл старого формата (без перекрытия страниц) — начинаем заново
     last_pub = time.time()
     wait = 180
     requests = 0
     while time.time() < DEADLINE:
         cyc = state.get("cycle")
+        # 1) починка неполных наборов: по одному запросу на игру — точный состав набора
+        if time.time() - state.get("last_repair", 0) > REPAIR_EVERY or state.get("repair"):
+            if not state.get("repair"):
+                per = {}
+                for h, v in cards.items():
+                    per[v[0]] = per.get(v[0], 0) + 1
+                state["repair"] = sorted(a for a, n in per.items() if n < MIN_SET)
+                log("починка неполных наборов:", len(state["repair"]), "игр")
+            if state["repair"]:
+                app = state["repair"][0]
+                try:
+                    d = fetch_page(0, sort=3, app=app)
+                    requests += 1
+                    wait = 180
+                except Limited:
+                    log("лимит Steam (починка), жду", wait, "с")
+                    if time.time() - last_pub > PUBLISH_EVERY:
+                        publish(state); last_pub = time.time()
+                    time.sleep(wait); wait = min(int(wait * 1.5), 600)
+                    continue
+                store(cards, d.get("results", []))
+                state["repair"].pop(0)
+                if MAX_PAGES and requests >= MAX_PAGES:
+                    break
+                if not state["repair"]:
+                    state["last_repair"] = time.time()
+                    log("починка завершена")
+                if time.time() - last_pub > PUBLISH_EVERY:
+                    publish(state); last_pub = time.time()
+                time.sleep(0.8)
+                continue
+            state["last_repair"] = time.time()
+
         if not cyc:
+            sort = 3 if state.get("cycles", 0) % 2 else 4   # чередуем порядок обхода между циклами
             try:
-                d = fetch_page(0)
+                d = fetch_page(0, sort=sort)
             except Limited:
                 log("лимит Steam, жду", wait, "с"); time.sleep(wait); wait = min(int(wait * 1.5), 600); continue
-            total = (d["total_count"] + PAGE - 1) // PAGE
-            cyc = state["cycle"] = {"total": total, "done": [], "started": int(time.time() * 1000)}
-            log("новый цикл:", total, "страниц")
+            total = (d["total_count"] + STEP - 1) // STEP
+            cyc = state["cycle"] = {"total": total, "done": [], "started": int(time.time() * 1000), "sort": sort}
+            log("новый цикл:", total, "страниц, сортировка", sort)
         todo = [p for p in range(cyc["total"]) if p not in set(cyc["done"])]
         if not todo:
             # цикл завершён: убираем карточки, которых больше нет на маркете
             before = len(cards)
-            for h in [h for h, v in cards.items() if v[5] < cyc["started"]]:
+            limit = int(time.time() * 1000) - KEEP_MS
+            for h in [h for h, v in cards.items() if v[5] < limit]:
                 del cards[h]
             state["last_complete"] = int(time.time() * 1000)
+            state["cycles"] = state.get("cycles", 0) + 1
             state["cycle"] = None
+            state["last_repair"] = 0   # после каждого цикла — проверить неполные наборы
             log("цикл завершён, удалено устаревших:", before - len(cards))
             publish(state); last_pub = time.time()
             continue
         p = todo[0]
         try:
-            d = fetch_page(p * PAGE)
+            d = fetch_page(p * STEP, sort=cyc.get("sort", 4))
             requests += 1
             wait = 180
         except Limited:
@@ -164,16 +227,7 @@ def main():
                 publish(state); last_pub = time.time()
             time.sleep(wait); wait = min(int(wait * 1.5), 600)
             continue
-        now = int(time.time() * 1000)
-        for r in d.get("results", []):
-            h = r["strHash"]
-            try:
-                appid = int(h.split("-", 1)[0])
-            except ValueError:
-                continue
-            ad = r.get("asset_description", {})
-            cards[h] = [appid, game_name(ad.get("type", "")), ad.get("name", ""),
-                        price(r.get("strMinSellSubtotal", "")), int(r.get("cSellOrders", 0)), now]
+        store(cards, d.get("results", []))
         cyc["done"].append(p)
         if len(cyc["done"]) % 25 == 0:
             log("цикл:", len(cyc["done"]), "/", cyc["total"], "карточек:", len(cards))
