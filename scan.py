@@ -14,7 +14,8 @@ STEP = 85           # шаг страниц меньше размера -> ст�
                     # поэтому сдвиг списка во время многочасового скана не «проглатывает» карточки
 KEEP_MS = 3 * 24 * 3600 * 1000   # карточку удаляем, только если её не видно 3 суток
 MIN_SET = 5         # в наборе Steam минимум 5 карточек — меньше значит набор собран не полностью
-REPAIR_EVERY = 6 * 3600          # проверка неполных наборов не чаще раза в 6 ч
+VERIFY_AGE = 24 * 3600 * 1000    # каждую игру перепроверяем отдельным запросом раз в сутки
+VERIFY_RATIO = 2                 # на 1 страницу общего скана — 2 перепроверки игр
 DEADLINE = time.time() + float(os.environ.get("RUN_SECONDS", 5 * 3600 + 20 * 60))
 PUBLISH_EVERY = float(os.environ.get("PUBLISH_EVERY", 20 * 60))
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "0"))      # для теста
@@ -115,6 +116,32 @@ def store(cards, results):
     return n
 
 
+def verify_game(cards, state, appid, results):
+    """Точный состав набора игры: обновляем найденные, пропавшие с маркета помечаем 0 в продаже."""
+    now = int(time.time() * 1000)
+    seen = set()
+    store(cards, results)
+    for r in results:
+        seen.add(r["strHash"])
+    for h, v in cards.items():
+        if v[0] == appid and h not in seen:
+            v[4] = 0
+            v[5] = now        # не удалять: карточка есть в наборе, просто сейчас никто не продаёт
+    state.setdefault("verified", {})[str(appid)] = now
+
+
+def build_verify_queue(cards, state, limit=300):
+    """Сначала самые дешёвые значки — неполные наборы выглядят дешёвыми и всплывают наверх."""
+    now = time.time() * 1000
+    ver = state.get("verified", {})
+    totals = {}
+    for h, v in cards.items():
+        totals[v[0]] = totals.get(v[0], 0.0) + v[3]
+    cand = [a for a in totals if now - ver.get(str(a), 0) > VERIFY_AGE]
+    cand.sort(key=lambda a: totals[a])
+    return cand[:limit]
+
+
 def clean(s):
     return s.replace("\t", " ").replace("\n", " ")
 
@@ -124,14 +151,17 @@ def build_catalog(state):
     for h, (appid, game, name, usd, listings, seen) in state["cards"].items():
         g = games.setdefault(appid, [game, []])
         g[1].append((name, h, usd, listings))
+    ver = state.get("verified", {})
     lines = ["T\t%d" % int(time.time() * 1000)]
     for appid, (game, cards) in games.items():
-        lines.append("G\t%d\t%s" % (appid, clean(game)))
+        lines.append("G\t%d\t%s\t%d" % (appid, clean(game), int(ver.get(str(appid), 0))))
         for name, h, usd, listings in cards:
             lines.append("C\t%s\t%s\t%s\t%d" % (clean(name), clean(h), repr(usd), listings))
     with gzip.open("catalog.tsv.gz", "wt", encoding="utf-8", compresslevel=9) as f:
         f.write("\n".join(lines) + "\n")
-    meta = {"updated": int(time.time() * 1000), "games": len(games), "cards": len(state["cards"]),
+    now = time.time() * 1000
+    meta = {"updated": int(now), "games": len(games), "cards": len(state["cards"]),
+            "verified_24h": sum(1 for a in games if now - ver.get(str(a), 0) < VERIFY_AGE),
             "last_complete": state.get("last_complete", 0),
             "cycle_done": len(state["cycle"]["done"]) if state.get("cycle") else 0,
             "cycle_total": state["cycle"]["total"] if state.get("cycle") else 0}
@@ -160,38 +190,35 @@ def main():
     requests = 0
     while time.time() < DEADLINE:
         cyc = state.get("cycle")
-        # 1) починка неполных наборов: по одному запросу на игру — точный состав набора
-        if time.time() - state.get("last_repair", 0) > REPAIR_EVERY or state.get("repair"):
-            if not state.get("repair"):
-                per = {}
-                for h, v in cards.items():
-                    per[v[0]] = per.get(v[0], 0) + 1
-                state["repair"] = sorted(a for a, n in per.items() if n < MIN_SET)
-                log("починка неполных наборов:", len(state["repair"]), "игр")
-            if state["repair"]:
-                app = state["repair"][0]
+        # 1) перепроверка игр по одной (точный состав набора), чередуется с общим сканом
+        if state.get("vstep", 0) < VERIFY_RATIO:
+            q = state.get("vqueue") or []
+            if not q:
+                q = state["vqueue"] = build_verify_queue(cards, state)
+                if q:
+                    log("очередь перепроверки:", len(q), "игр (от самых дешёвых)")
+            if q:
+                app = q[0]
                 try:
                     d = fetch_page(0, sort=3, app=app)
                     requests += 1
                     wait = 180
                 except Limited:
-                    log("лимит Steam (починка), жду", wait, "с")
+                    log("лимит Steam (перепроверка), жду", wait, "с")
                     if time.time() - last_pub > PUBLISH_EVERY:
                         publish(state); last_pub = time.time()
                     time.sleep(wait); wait = min(int(wait * 1.5), 600)
                     continue
-                store(cards, d.get("results", []))
-                state["repair"].pop(0)
+                verify_game(cards, state, app, d.get("results", []))
+                q.pop(0)
+                state["vstep"] = state.get("vstep", 0) + 1
                 if MAX_PAGES and requests >= MAX_PAGES:
                     break
-                if not state["repair"]:
-                    state["last_repair"] = time.time()
-                    log("починка завершена")
                 if time.time() - last_pub > PUBLISH_EVERY:
                     publish(state); last_pub = time.time()
                 time.sleep(0.8)
                 continue
-            state["last_repair"] = time.time()
+        state["vstep"] = 0
 
         if not cyc:
             sort = 3 if state.get("cycles", 0) % 2 else 4   # чередуем порядок обхода между циклами
@@ -212,7 +239,7 @@ def main():
             state["last_complete"] = int(time.time() * 1000)
             state["cycles"] = state.get("cycles", 0) + 1
             state["cycle"] = None
-            state["last_repair"] = 0   # после каждого цикла — проверить неполные наборы
+            state["vqueue"] = []      # после цикла — заново выбрать игры для перепроверки
             log("цикл завершён, удалено устаревших:", before - len(cards))
             publish(state); last_pub = time.time()
             continue
